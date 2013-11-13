@@ -18,7 +18,7 @@ class NdbRankerNode(ndb.Model):
         self.count += 1
         if value == self.value:
             self.keys.append(key)
-            return self
+            inserted = self
         else:
             if value < self.value:
                 attr = 'left'
@@ -27,44 +27,82 @@ class NdbRankerNode(ndb.Model):
 
             node = getattr(self, attr)
             if node:
-                return node.insert(key, value)
+                inserted = node.get().insert(key, value)
             else:
                 node = _new(self.shardId(), key, value, self, attr == 'left')
-                setattr(self, attr, node)
-                return node
+                setattr(self, attr, node.key)
+                inserted = node
+        self.put()
+        return inserted
 
-    def rank(self):
-        same = self.count
-        less = 0
-        more = 0
+    def remove(self, key):
+        self.keys.remove(key)
+        self.count -= 1
+        self.put()
+        parentNode = self.parentNode
+        while parentNode is not None:
+            parent = parentNode.get()
+            parent.count -= 1
+            parentNode = parent.parentNode
+            parent.put()
+
+    def getLess(self):
         if self.left:
-            less += self.left.get().count
+            return self.left.get().count
+        else:
+            return 0
+
+    def getMore(self):
         if self.right:
-            more += self.right.get().count
-        if self.parent:
-            unaccounted = self.parent.get().count
-            unaccounted -= (same + less + more)
-            if self.parentLeft:
-                more += unaccounted
+            return self.right.get().count
+        else:
+            return 0
+
+    def getRank(self, value):
+        less = self.getLess()
+        more = self.getMore()
+        same = self.count - less - more
+        if value == self.value:
+            return (less, same, more)
+        elif value < self.value:
+            if self.left:
+                (leftLess, leftSame, leftMore) = self.left.get().getRank(value)
+                return (leftLess, leftSame, leftMore + more + same)
             else:
-                less += unaccounted
-        return (less, same, more)
+                return (0, 0, self.count)
+        else:
+            if self.right:
+                (rightLess, rightSame, rightMore) = self.right.get().getRank(value)
+                return (rightLess + less + same, rightSame, rightMore)
+            else:
+                return (self.count, 0, 0)
 
     def shardId(self):
         return self.key.parent().id()
 
-def getRank(shardId, key):
-    pass
+    def pprint(self, indent="", direction=""):
+        print "%s%s:%s %s %s" % (indent, direction, self.value, self.count, self.keys)
+        if self.left:
+            self.left.get().pprint(indent+" ", 'L')
+        if self.right:
+            self.right.get().pprint(indent+" ", 'R')
+
+def getPercentile(shardId, value):
+    (less, same, more) = getRank(shardId, value)
+    return (more + same) / float(less + same + more)
+
+def getRank(shardId, value):
+    root = _root(shardId)
+    return root.getRank(value)
 
 @ndb.transactional(retries=5)
 def insert(shardId, key, value):
-    #_remove(shardId, key)
+    _remove(shardId, key)
     root = _root(shardId)
     if root is None:
-        node = _new(shardId, key, value)
+        _new(shardId, key, value)
     else:
-        node = root.insert(key, value)
-    return node.rank()
+        root.insert(key, value)
 
 @ndb.transactional(retries=5)
 def remove(shardId, key):
@@ -79,14 +117,16 @@ def _new(shardId, key, value, parentNode=None, parentLeft=None):
         keys=[key],
         value=value,
         count=1,
-        parentNode=parentNode,
+        parentNode=parentNode.key if parentNode else None,
         parentLeft=parentLeft,
     )
     node.put()
     return node
 
 def _remove(shardId, key):
-    pass
+    node = _getNode(shardId, key)
+    if node:
+        node.remove(key)
 
 def _root(shardId):
     return NdbRankerNode.query(ancestor=_shardKey(shardId)).filter(NdbRankerNode.parentNode == None).get()
