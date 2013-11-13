@@ -8,32 +8,18 @@ class NdbRankerNode(ndb.Model):
     keys = ndb.StringProperty(repeated=True)
     value = ndb.FloatProperty()
 
-    parentLeft = ndb.BooleanProperty()
     parentNode = ndb.KeyProperty(kind='NdbRankerNode')
-
     left = ndb.KeyProperty(kind='NdbRankerNode')
     right = ndb.KeyProperty(kind='NdbRankerNode')
 
     def insert(self, key, value):
-        self.count += 1
         if value == self.value:
-            self.keys.append(key)
-            inserted = self
+            self._increment(key)
         else:
-            if value < self.value:
-                attr = 'left'
-            else:
-                attr = 'right'
-
-            node = getattr(self, attr)
-            if node:
-                inserted = node.get().insert(key, value)
-            else:
-                node = _new(self.shardId(), key, value, self, attr == 'left')
-                setattr(self, attr, node.key)
-                inserted = node
-        self.put()
-        return inserted
+            if value < self.value: direction = 'left'
+            else: direction = 'right'
+            childNode = self._insert(direction, key, value)
+            childNode.insert(key, value)
 
     def remove(self, key):
         self.keys.remove(key)
@@ -87,38 +73,62 @@ class NdbRankerNode(ndb.Model):
         if self.right:
             self.right.get().pprint(indent+" ", 'R')
 
+
+    @ndb.transactional(retries=3)
+    def _insert(self, direction, key, value):
+        """
+            Atomically insert the value, creating a new node if necessary.
+        """
+        self.count += 1
+        node = getattr(self, direction)
+        if node:
+            self.put()
+            return node.get()
+        else:
+            node = _new(self.shardId(), value, self)
+            setattr(self, direction, node.key)
+            self.put()
+            return node
+
+    @ndb.transactional(retries=3)
+    def _increment(self, key):
+        """
+            Atomically increment the counter, and append the key
+        """
+        self.count += 1
+        if key: self.keys.append(key)
+        self.put()
+
 def getPercentile(shardId, value):
-    (less, same, more) = getRank(shardId, value)
-    return (more + same) / float(less + same + more)
+    rank = getRank(shardId, value)
+    if rank is not None:
+        (less, same, more) = getRank(shardId, value)
+        return (more + same) / float(less + same + more)
 
 def getRank(shardId, value):
     root = _root(shardId)
-    return root.getRank(value)
+    if root is not None:
+        return root.getRank(value)
 
-@ndb.transactional(retries=5)
 def insert(shardId, key, value):
     _remove(shardId, key)
     root = _root(shardId)
     if root is None:
-        _new(shardId, key, value)
-    else:
-        root.insert(key, value)
+        root = _new(shardId, value)
+    root.insert(key, value)
 
-@ndb.transactional(retries=5)
 def remove(shardId, key):
     _remove(shardId, key)
 
 def _getNode(shardId, key):
     return NdbRankerNode.query(ancestor=_shardKey(shardId)).filter(NdbRankerNode.keys == key).get()
 
-def _new(shardId, key, value, parentNode=None, parentLeft=None):
+def _new(shardId, value, parentNode=None):
     node = NdbRankerNode(
         parent=_shardKey(shardId),
-        keys=[key],
         value=value,
-        count=1,
+        count=0,
         parentNode=parentNode.key if parentNode else None,
-        parentLeft=parentLeft,
     )
     node.put()
     return node
