@@ -1,7 +1,8 @@
-import logging
-import time
+import math
+import datetime
 
-from google.appengine.api import memcache
+from google.appengine.ext import ndb
+from google.appengine.ext.ndb import Future
 
 def getPercentile(
         name,
@@ -9,60 +10,91 @@ def getPercentile(
         field,
         value,
         samples=100,
-        expires=600,
-        minSamplesToCache=100):
-    percentiler = getPercentiler(name, query, field, samples, expires, minSamplesToCache)
-    return percentiler.percentile(value)
+        expires=600):
+    percentiler = getPercentiler(name, query, field, samples, expires)
+    if percentiler:
+        return percentiler.percentile(value)
 
 def getPercentiler(
         name,
         query,
         field,
         samples=100,
-        expires=600,
-        minSamplesToCache=100):
-    key = 'NDBRANKER:%s' % name
-    existing = memcache.get(key)
-    if existing:
+        expires=600):
+    existing = Percentiler.get_by_id(name)
+    if existing and (datetime.datetime.now() - existing.created < datetime.timedelta(seconds=expires)):
         return existing
     else:
-        start = time.time()
-        percentiler = _getPercentiler(query, field, samples)
-        end = time.time()
-        logging.debug("built percentiler %s in %s seconds" % (name, end-start))
-        if percentiler.samples >= minSamplesToCache:
-            memcache.set(key, percentiler, time=expires)
-        return percentiler
+        return _getPercentiler(query, field, samples, name)
 
-def _getPercentiler(query, field, samples):
-    query = query.order(field)
-    count = query.count()
-    samples = min(samples, count)
-    percentiles = []
-    for i in range(0, samples):
-        percentile = i / float(samples)
-        offset = int(round(percentile * (count)))
-        entity = query.get(offset=offset, projection=[field])
-        value = getattr(entity, field._name)
-        if value is not None:
-            percentiles.append(value)
-    return Percentiler(percentiles)
+def _getPercentiler(query, field, samples, name):
+    count = query.count(limit=samples)
+    if count >= samples:
+        minEntity = query.order(field).get(projection=[field])
+        maxEntity = query.order(-field).get(projection=[field])
+        if minEntity and maxEntity:
+            minValue = getattr(minEntity, field._name)
+            maxValue = getattr(maxEntity, field._name)
 
-class Percentiler(object):
+            futures = []
+            width = (maxValue - minValue) / float(samples)
+            for i in range(0, samples):
+                start = i * width
+                end = start + width
+                rangeQuery = query.filter(field >= start)
+                if i < (samples - 1):
+                    rangeQuery = rangeQuery.filter(field < end)
+                else:
+                    rangeQuery = rangeQuery.filter(field <= end) # include the max value!
+                futures.append(rangeQuery.count_async())
 
-    def __init__(self, percentiles):
-        self.percentiles = percentiles
-        self.samples = len(self.percentiles)
+            # would be smart to vary the size of bands based on results, in case data is not nicely distributed...
+
+            Future.wait_all(futures)
+            histogram = [future.get_result() for future in futures]
+            total = sum(histogram)
+            if total > 0:
+                percentiler = Percentiler(id=name)
+                percentiler.compute(total, minValue, maxValue, histogram)
+                percentiler.put()
+                return percentiler
+
+class Percentiler(ndb.Model):
+
+    cdf = ndb.FloatProperty(repeated=True)
+    created = ndb.DateTimeProperty()
+    min = ndb.FloatProperty()
+    max = ndb.FloatProperty()
+    total = ndb.IntegerProperty()
+    width = ndb.FloatProperty()
+
+    def compute(self, total, min, max, histogram):
+        self.total = total
+        self.created = datetime.datetime.now()
+        self.min = min
+        self.max = max
+        self.width = (max - min) / (len(histogram))
+
+        cumulative = 0.0
+        self.cdf = []
+        for count in histogram:
+            cumulative += count / float(self.total)
+            self.cdf.append(cumulative)
 
     def percentile(self, value):
-        if value < self.percentiles[0]:
+        offset = value - self.min
+        upper = math.ceil(offset / self.width)
+        lower = math.floor(offset / self.width)
+        if lower < 0:
             return 0.
+        elif upper >= len(self.cdf):
+            return 1.0
+        else:
+            top = self.cdf[int(upper)]
+            bottom = self.cdf[int(lower)]
+            height = (top - bottom)
 
-        for i in range(1, self.samples):
-            upper = self.percentiles[i]
-            if value < upper:
-                lower = self.percentiles[i-1]
-                position = (value - lower) / (upper - lower)
-                return ((i - 1) + position) / self.samples
+            lowerValue = self.min + lower * self.width
 
-        return 1.0
+            offsetFromLower = value - lowerValue
+            return bottom + (height) * ((offsetFromLower) / self.width)

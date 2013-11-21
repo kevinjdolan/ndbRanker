@@ -22,7 +22,12 @@ class TestCase(unittest.TestCase):
         random.shuffle(samples)
         for sample in samples:
             TestModel(number=sample).put()
-        self.assertEqual(0.25, ndbRanker.getPercentile('TEST', TestModel.query(), TestModel.number, 25))
+        self.assertAlmostEqual(0.26, ndbRanker.getPercentile('TEST', TestModel.query(), TestModel.number, 25), places=2)
+        self.assertAlmostEqual(0., ndbRanker.getPercentile('TEST', TestModel.query(), TestModel.number, -10), places=2)
+        self.assertAlmostEqual(0.01, ndbRanker.getPercentile('TEST', TestModel.query(), TestModel.number, 0), places=2)
+        self.assertAlmostEqual(1., ndbRanker.getPercentile('TEST', TestModel.query(), TestModel.number, 200), places=2)
+        self.assertAlmostEqual(1., ndbRanker.getPercentile('TEST', TestModel.query(), TestModel.number, 99), places=2)
+        self.assertAlmostEqual(1., ndbRanker.getPercentile('TEST', TestModel.query(), TestModel.number, 98.999), places=2)
 
     def tearDown(self):
         self.testbed.deactivate()
